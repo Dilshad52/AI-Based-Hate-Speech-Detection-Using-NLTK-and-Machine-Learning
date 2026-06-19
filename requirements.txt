@@ -1,6 +1,7 @@
-pip install Flask==3.0.3
-pip install PyMySQL==1.1.1
-pip install pandas==2.2.2
-pip install matplotlib==3.9.0
-pip install scikit-learn==1.5.1
-pip install nltk==3.9.1
+Flask==3.0.3
+PyMySQL==1.1.1
+pandas==2.2.2
+matplotlib==3.9.0
+scikit-learn==1.5.1
+nltk==3.9.1
+gunicorn==23.0.0
