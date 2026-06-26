@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, session, flash
-import pymysql
+import sqlite3
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -9,9 +9,8 @@ import re
 import pickle
 import random
 import nltk
-from urllib.parse import urlparse
 
-# NLTK setup for cloud
+# NLTK setup
 nltk_data_dir = os.path.join(os.getcwd(), 'nltk_data')
 if not os.path.exists(nltk_data_dir):
     os.makedirs(nltk_data_dir)
@@ -38,6 +37,7 @@ stemmer = PorterStemmer()
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'secret_key_123')
 
+# Create directories
 UPLOAD_FOLDER = "uploads"
 MODEL_FOLDER = "models"
 GRAPH_FOLDER = os.path.join("static", "graphs")
@@ -46,41 +46,67 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(MODEL_FOLDER, exist_ok=True)
 os.makedirs(GRAPH_FOLDER, exist_ok=True)
 
-# Database connection for cloud
-def get_db_connection():
-    try:
-        database_url = os.environ.get('DATABASE_URL')
-        if database_url:
-            parsed = urlparse(database_url)
-            return pymysql.connect(
-                host=parsed.hostname,
-                user=parsed.username,
-                password=parsed.password,
-                database=parsed.path[1:],
-                port=parsed.port or 3306,
-                cursorclass=pymysql.cursors.DictCursor
-            )
-        else:
-            # Local development fallback
-            return pymysql.connect(
-                host="localhost",
-                user="root",
-                password="root",
-                database="hate_speech_ai",
-                cursorclass=pymysql.cursors.DictCursor
-            )
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
+# ---------- SQLITE DATABASE ----------
+DB_PATH = os.path.join(os.path.dirname(__file__), 'hate_speech.db')
 
-def db():
-    conn = get_db_connection()
-    if conn is None:
-        print("WARNING: Could not connect to database")
-        # Return a dummy connection that will fail gracefully
-        return None
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    
+    # Users table
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        email TEXT,
+        mobile TEXT,
+        address TEXT,
+        status TEXT DEFAULT 'active',
+        warning_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # History table
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        text TEXT,
+        prediction TEXT,
+        admin_action TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Admin table
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS admin(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        password TEXT
+    )
+    ''')
+    
+    # Insert default admin
+    cur.execute("SELECT * FROM admin WHERE username='admin'")
+    if not cur.fetchone():
+        cur.execute("INSERT INTO admin(username,password) VALUES('admin','admin')")
+    
+    conn.commit()
+    conn.close()
+    print("Database initialized successfully!")
+
+# Initialize database
+init_db()
+
+# ---------- HELPER FUNCTIONS ----------
 def admin_required():
     return "admin" in session
 
@@ -104,12 +130,6 @@ def clean_text(text):
     
     return " ".join(words)
 
-def get_dataset_path():
-    return session.get("dataset_path")
-
-def get_preprocessed_path():
-    return session.get("preprocessed_path")
-
 def load_saved_vectorizer():
     vectorizer_path = os.path.join(MODEL_FOLDER, "vectorizer.pkl")
     if os.path.exists(vectorizer_path):
@@ -131,7 +151,7 @@ def load_best_model_name():
             return f.read().strip()
     return "Not Available"
 
-# ---------------------- ROUTES ----------------------
+# ---------- ROUTES ----------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -145,27 +165,23 @@ def register():
         mobile = request.form["mobile"].strip()
         address = request.form["address"].strip()
 
-        con = db()
-        if con is None:
-            flash("Database connection error. Please try again later.")
-            return redirect("/register")
-            
-        cur = con.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        cur.execute("SELECT * FROM users WHERE username=?", (username,))
         existing = cur.fetchone()
 
         if existing:
-            con.close()
+            conn.close()
             flash("Username already exists")
             return redirect("/register")
 
         cur.execute(
-            "INSERT INTO users(username,password,email,mobile,address,status,warning_count) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO users(username,password,email,mobile,address,status,warning_count) VALUES(?,?,?,?,?,?,?)",
             (username, password, email, mobile, address, "active", 0)
         )
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
         flash("Registration successful")
         return redirect("/login")
@@ -178,21 +194,17 @@ def login():
         username = request.form["username"].strip()
         password = request.form["password"].strip()
 
-        con = db()
-        if con is None:
-            flash("Database connection error. Please try again later.")
-            return redirect("/login")
-            
-        cur = con.cursor()
+        conn = get_db()
+        cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM users WHERE username=%s AND password=%s",
+            "SELECT * FROM users WHERE username=? AND password=?",
             (username, password)
         )
         data = cur.fetchone()
-        con.close()
+        conn.close()
 
         if data:
-            if data.get("status") == "blocked":
+            if data["status"] == "blocked":
                 flash("Your account is blocked by admin")
                 return redirect("/login")
 
@@ -274,7 +286,7 @@ def preprocess():
     if not admin_required():
         return redirect("/admin")
 
-    path = get_dataset_path()
+    path = session.get("dataset_path")
     if not path or not os.path.exists(path):
         flash("Please upload dataset first")
         return redirect("/upload")
@@ -325,17 +337,13 @@ def train():
     if not admin_required():
         return redirect("/admin")
 
-    path = get_preprocessed_path()
+    path = session.get("preprocessed_path")
     if not path or not os.path.exists(path):
         flash("Please preprocess dataset first")
         return redirect("/preprocess")
 
     try:
         df = pd.read_csv(path)
-
-        if "text" not in df.columns or "label" not in df.columns:
-            flash("Preprocessed dataset must contain 'text' and 'label'")
-            return redirect("/preprocess")
 
         X = df["text"].astype(str)
         y = df["label"].astype(str)
@@ -448,15 +456,14 @@ def predict():
             pred = model.predict(input_vec)[0]
             result = pred
 
-            con = db()
-            if con is not None:
-                cur = con.cursor()
-                cur.execute(
-                    "INSERT INTO history(username,text,prediction,admin_action) VALUES(%s,%s,%s,%s)",
-                    (session["user"], text, pred, "pending")
-                )
-                con.commit()
-                con.close()
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO history(username,text,prediction,admin_action) VALUES(?,?,?,?)",
+                (session["user"], text, pred, "pending")
+            )
+            conn.commit()
+            conn.close()
 
             flash("AI prediction completed successfully")
 
@@ -470,20 +477,16 @@ def history():
     if not user_required():
         return redirect("/login")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/predict")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute("""
         SELECT id, username, text, prediction, admin_action
         FROM history
-        WHERE username=%s
+        WHERE username=?
         ORDER BY id DESC
     """, (session["user"],))
     data = cur.fetchall()
-    con.close()
+    conn.close()
 
     return render_template("history.html", data=data)
 
@@ -492,15 +495,11 @@ def users():
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/admin_home")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute("SELECT * FROM users ORDER BY id DESC")
     data = cur.fetchall()
-    con.close()
+    conn.close()
 
     return render_template("users.html", data=data)
 
@@ -509,15 +508,11 @@ def all_history():
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/admin_home")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute("SELECT * FROM history ORDER BY id DESC")
     data = cur.fetchall()
-    con.close()
+    conn.close()
 
     return render_template("all_history.html", data=data)
 
@@ -526,12 +521,8 @@ def review_predictions():
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/admin_home")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute("""
         SELECT h.id, h.username, h.text, h.prediction, h.admin_action,
                u.status, u.warning_count
@@ -540,7 +531,7 @@ def review_predictions():
         ORDER BY h.id DESC
     """)
     data = cur.fetchall()
-    con.close()
+    conn.close()
 
     return render_template("review_predictions.html", data=data)
 
@@ -549,31 +540,27 @@ def give_warning(history_id, username):
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/review_predictions")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cur.execute("SELECT * FROM history WHERE id=%s", (history_id,))
+    cur.execute("SELECT * FROM history WHERE id=?", (history_id,))
     row = cur.fetchone()
 
     if row and row["prediction"] == "hate" and row["admin_action"] == "pending":
         cur.execute(
-            "UPDATE users SET warning_count = warning_count + 1 WHERE username=%s",
+            "UPDATE users SET warning_count = warning_count + 1 WHERE username=?",
             (username,)
         )
         cur.execute(
-            "UPDATE history SET admin_action=%s WHERE id=%s",
+            "UPDATE history SET admin_action=? WHERE id=?",
             ("warned", history_id)
         )
-        con.commit()
+        conn.commit()
         flash(f"Warning given to {username}")
     else:
         flash("Warning action not allowed")
 
-    con.close()
+    conn.close()
     return redirect("/review_predictions")
 
 @app.route("/block_user/<int:history_id>/<username>")
@@ -581,31 +568,27 @@ def block_user(history_id, username):
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/review_predictions")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cur.execute("SELECT * FROM history WHERE id=%s", (history_id,))
+    cur.execute("SELECT * FROM history WHERE id=?", (history_id,))
     row = cur.fetchone()
 
     if row and row["prediction"] == "offensive" and row["admin_action"] == "pending":
         cur.execute(
-            "UPDATE users SET status=%s WHERE username=%s",
+            "UPDATE users SET status=? WHERE username=?",
             ("blocked", username)
         )
         cur.execute(
-            "UPDATE history SET admin_action=%s WHERE id=%s",
+            "UPDATE history SET admin_action=? WHERE id=?",
             ("blocked", history_id)
         )
-        con.commit()
+        conn.commit()
         flash(f"User {username} has been blocked")
     else:
         flash("Block action not allowed")
 
-    con.close()
+    conn.close()
     return redirect("/review_predictions")
 
 @app.route("/unblock_user/<username>")
@@ -613,18 +596,14 @@ def unblock_user(username):
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/users")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute(
-        "UPDATE users SET status=%s WHERE username=%s",
+        "UPDATE users SET status=? WHERE username=?",
         ("active", username)
     )
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
     flash(f"User {username} unblocked successfully")
     return redirect("/users")
@@ -634,20 +613,14 @@ def delete_history(id):
     if not user_required():
         return redirect("/login")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/history")
-        
-    cur = con.cursor()
-
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute(
-        "DELETE FROM history WHERE id=%s AND username=%s",
+        "DELETE FROM history WHERE id=? AND username=?",
         (id, session["user"])
     )
-
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
     flash("History deleted successfully")
     return redirect("/history")
@@ -657,15 +630,11 @@ def admin_delete_history(id):
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/all_history")
-        
-    cur = con.cursor()
-    cur.execute("DELETE FROM history WHERE id=%s", (id,))
-    con.commit()
-    con.close()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM history WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
 
     flash("History deleted by admin")
     return redirect("/all_history")
@@ -675,19 +644,19 @@ def admin_delete_all_history():
     if not admin_required():
         return redirect("/admin")
 
-    con = db()
-    if con is None:
-        flash("Database connection error")
-        return redirect("/all_history")
-        
-    cur = con.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute("DELETE FROM history")
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
     flash("All history deleted by admin")
     return redirect("/all_history")
 
+@app.route("/test")
+def test():
+    return "✅ App is working! The server is running correctly."
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)  # Set debug=False for production
+    app.run(host="0.0.0.0", port=port, debug=False)
